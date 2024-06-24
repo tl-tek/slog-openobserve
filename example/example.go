@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	slogwebhook "github.com/samber/slog-webhook/v2"
+	slogwebhook "github.com/tl-tek/slog-openobserve"
 
 	"log/slog"
 )

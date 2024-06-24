@@ -1,4 +1,4 @@
-module github.com/samber/slog-webhook/v2
+module github.com/tl-tek/slog-openobserve
 
 go 1.21
 

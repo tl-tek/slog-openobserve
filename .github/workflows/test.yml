@@ -27,11 +27,3 @@ jobs:
 
     - name: Test
       run: make coverage
-
-    - name: Codecov
-      uses: codecov/codecov-action@v2
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
-        file: ./cover.out
-        flags: unittests
-        verbose: true
