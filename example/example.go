@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	slogwebhook "github.com/tl-tek/slog-openobserve"
+	slogopenobserve "github.com/tl-tek/slog-openobserve"
 
 	"log/slog"
 )
@@ -13,7 +13,7 @@ import (
 func main() {
 	url := "https://webhook.site/xxxxxx"
 
-	logger := slog.New(slogwebhook.Option{Level: slog.LevelDebug, Endpoint: url}.NewWebhookHandler())
+	logger := slog.New(slogopenobserve.Option{Level: slog.LevelDebug, Endpoint: url}.NewOpenobserveHandler())
 	logger = logger.With("release", "v1.0.0")
 
 	req, _ := http.NewRequest(http.MethodGet, "https://api.screeb.app", nil)

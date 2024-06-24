@@ -1,4 +1,4 @@
-package slogwebhook
+package slogopenobserve
 
 import (
 	"net/http"

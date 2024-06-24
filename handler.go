@@ -1,4 +1,4 @@
-package slogwebhook
+package slogopenobserve
 
 import (
 	"bytes"
@@ -18,6 +18,8 @@ type Option struct {
 
 	// URL
 	Endpoint string
+	Method   string
+	Header   http.Header
 	Timeout  time.Duration // default: 10s
 
 	// optional: customize webhook event builder
@@ -32,7 +34,7 @@ type Option struct {
 	ReplaceAttr func(groups []string, a slog.Attr) slog.Attr
 }
 
-func (o Option) NewWebhookHandler() slog.Handler {
+func (o Option) NewOpenobserveHandler() slog.Handler {
 	if o.Level == nil {
 		o.Level = slog.LevelDebug
 	}
@@ -53,55 +55,72 @@ func (o Option) NewWebhookHandler() slog.Handler {
 		o.AttrFromContext = []func(ctx context.Context) []slog.Attr{}
 	}
 
-	return &WebhookHandler{
+	return &OpenobserveHandler{
 		option: o,
 		attrs:  []slog.Attr{},
 		groups: []string{},
 	}
 }
 
-var _ slog.Handler = (*WebhookHandler)(nil)
+var _ slog.Handler = (*OpenobserveHandler)(nil)
 
-type WebhookHandler struct {
+type OpenobserveHandler struct {
 	option Option
 	attrs  []slog.Attr
 	groups []string
 }
 
-func (h *WebhookHandler) Enabled(_ context.Context, level slog.Level) bool {
+func (h *OpenobserveHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= h.option.Level.Level()
 }
 
-func (h *WebhookHandler) Handle(ctx context.Context, record slog.Record) error {
+func (h *OpenobserveHandler) Handle(ctx context.Context, record slog.Record) error {
 	fromContext := slogcommon.ContextExtractor(ctx, h.option.AttrFromContext)
 	payload := h.option.Converter(h.option.AddSource, h.option.ReplaceAttr, append(h.attrs, fromContext...), h.groups, &record)
 
 	go func() {
-		_ = send(h.option.Endpoint, h.option.Timeout, h.option.Marshaler, payload)
+		_ = send(h.option.Endpoint, h.option.Method, h.option.Header, h.option.Timeout, h.option.Marshaler, payload)
 	}()
 
 	return nil
 }
 
-func (h *WebhookHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &WebhookHandler{
+func (h *OpenobserveHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &OpenobserveHandler{
 		option: h.option,
 		attrs:  slogcommon.AppendAttrsToGroup(h.groups, h.attrs, attrs...),
 		groups: h.groups,
 	}
 }
 
-func (h *WebhookHandler) WithGroup(name string) slog.Handler {
-	return &WebhookHandler{
+func (h *OpenobserveHandler) WithGroup(name string) slog.Handler {
+	return &OpenobserveHandler{
 		option: h.option,
 		attrs:  h.attrs,
 		groups: append(h.groups, name),
 	}
 }
 
-func send(endpoint string, timeout time.Duration, marshaler func(v any) ([]byte, error), payload map[string]any) error {
-	client := http.Client{
-		Timeout: time.Duration(10) * time.Second,
+func send(endpoint, method string, header http.Header, timeout time.Duration, marshaler func(v any) ([]byte, error), payload map[string]any) error {
+	var (
+		_method = http.MethodPost
+		_header = http.Header{
+			"Content-Type": []string{"application/json"},
+			"user-agent":   []string{name},
+		}
+		client = http.Client{
+			Timeout: time.Duration(10) * time.Second,
+		}
+	)
+
+	if len(method) > 0 {
+		_method = method
+	}
+
+	if len(header) > 0 {
+		for k, v := range header {
+			_header[k] = v
+		}
 	}
 
 	json, err := marshaler(payload)
@@ -115,13 +134,12 @@ func send(endpoint string, timeout time.Duration, marshaler func(v any) ([]byte,
 	defer cancel()
 
 	// @TODO: maintain a pool of tcp connections
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, body)
+	req, err := http.NewRequestWithContext(ctx, _method, endpoint, body)
 	if err != nil {
 		return err
 	}
 
-	req.Header.Add("content-type", `application/json`)
-	req.Header.Add("user-agent", name)
+	req.Header = _header
 
 	resp, err := client.Do(req)
 	if err != nil {

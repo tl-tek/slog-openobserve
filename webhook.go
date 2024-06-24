@@ -1,1 +1,1 @@
-package slogwebhook
+package slogopenobserve
