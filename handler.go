@@ -3,7 +3,10 @@ package slogopenobserve
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -16,11 +19,13 @@ type Option struct {
 	// log level (default: debug)
 	Level slog.Leveler
 
-	// URL
-	Endpoint string
-	Method   string
-	Header   http.Header
-	Timeout  time.Duration // default: 10s
+	Endpoint      string
+	Username      string
+	Password      string
+	Organization  string
+	Stream        string
+	CustomHeaders map[string]string
+	Timeout       time.Duration // default: 10s
 
 	// optional: customize webhook event builder
 	Converter Converter
@@ -79,7 +84,10 @@ func (h *OpenobserveHandler) Handle(ctx context.Context, record slog.Record) err
 	payload := h.option.Converter(h.option.AddSource, h.option.ReplaceAttr, append(h.attrs, fromContext...), h.groups, &record)
 
 	go func() {
-		_ = send(h.option.Endpoint, h.option.Method, h.option.Header, h.option.Timeout, h.option.Marshaler, payload)
+		err := send(h.option, payload)
+		if err != nil {
+			log.Println("[ERROR] failed to send message to openobserve:", err)
+		}
 	}()
 
 	return nil
@@ -101,7 +109,7 @@ func (h *OpenobserveHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
-func send(endpoint, method string, header http.Header, timeout time.Duration, marshaler func(v any) ([]byte, error), payload map[string]any) error {
+func send(opts Option, payload map[string]any) error {
 	var (
 		_method = http.MethodPost
 		_header = http.Header{
@@ -113,40 +121,39 @@ func send(endpoint, method string, header http.Header, timeout time.Duration, ma
 		}
 	)
 
-	if len(method) > 0 {
-		_method = method
+	if opts.Username != "" && opts.Password != "" {
+		userPass := opts.Username + ":" + opts.Password
+		b64UserPass := base64.StdEncoding.EncodeToString([]byte(userPass))
+		_header.Set("Authorization", "Basic "+b64UserPass)
 	}
 
-	if len(header) > 0 {
-		for k, v := range header {
-			_header[k] = v
+	if len(opts.CustomHeaders) > 0 {
+		for k, v := range opts.CustomHeaders {
+			_header.Add(k, v)
 		}
 	}
 
-	json, err := marshaler(payload)
+	bts, err := opts.Marshaler(payload)
 	if err != nil {
 		return err
 	}
+	body := bytes.NewBuffer(bts)
 
-	body := bytes.NewBuffer(json)
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
 	defer cancel()
 
+	endpointUrl := fmt.Sprintf("%s/api/%s/%s/_multi", opts.Endpoint, opts.Organization, opts.Stream)
 	// @TODO: maintain a pool of tcp connections
-	req, err := http.NewRequestWithContext(ctx, _method, endpoint, body)
+	req, err := http.NewRequestWithContext(ctx, _method, endpointUrl, body)
 	if err != nil {
 		return err
 	}
 
 	req.Header = _header
-
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
-
 	defer resp.Body.Close()
-
 	return nil
 }
