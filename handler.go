@@ -1,18 +1,17 @@
 package slogopenobserve
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
-	"log/slog"
-
 	slogcommon "github.com/samber/slog-common"
+	"github.com/valyala/fasthttp"
 )
 
 type Option struct {
@@ -25,7 +24,7 @@ type Option struct {
 	Organization  string
 	Stream        string
 	CustomHeaders map[string]string
-	Timeout       time.Duration // default: 10s
+	Timeout       time.Duration // default: 3s
 
 	// optional: customize webhook event builder
 	Converter Converter
@@ -45,7 +44,7 @@ func (o Option) NewOpenobserveHandler() slog.Handler {
 	}
 
 	if o.Timeout == 0 {
-		o.Timeout = 10 * time.Second
+		o.Timeout = 3 * time.Second
 	}
 
 	if o.Converter == nil {
@@ -110,50 +109,33 @@ func (h *OpenobserveHandler) WithGroup(name string) slog.Handler {
 }
 
 func send(opts Option, payload map[string]any) error {
-	var (
-		_method = http.MethodPost
-		_header = http.Header{
-			"Content-Type": []string{"application/json"},
-			"user-agent":   []string{name},
-		}
-		client = http.Client{
-			Timeout: time.Duration(10) * time.Second,
-		}
-	)
-
+	req := fasthttp.AcquireRequest()
+	req.Header.SetContentType("application/json")
+	req.Header.SetUserAgent(name)
 	if opts.Username != "" && opts.Password != "" {
 		userPass := opts.Username + ":" + opts.Password
 		b64UserPass := base64.StdEncoding.EncodeToString([]byte(userPass))
-		_header.Set("Authorization", "Basic "+b64UserPass)
+		req.Header.Set("Authorization", "Basic "+b64UserPass)
 	}
-
 	if len(opts.CustomHeaders) > 0 {
 		for k, v := range opts.CustomHeaders {
-			_header.Add(k, v)
+			req.Header.Set(k, v)
 		}
 	}
-
 	bts, err := opts.Marshaler(payload)
 	if err != nil {
 		return err
 	}
-	body := bytes.NewBuffer(bts)
-
-	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
-	defer cancel()
-
+	req.SetBody(bts)
+	req.Header.SetMethod(http.MethodPost)
 	endpointUrl := fmt.Sprintf("%s/api/%s/%s/_multi", opts.Endpoint, opts.Organization, opts.Stream)
-	// @TODO: maintain a pool of tcp connections
-	req, err := http.NewRequestWithContext(ctx, _method, endpointUrl, body)
-	if err != nil {
+	req.SetRequestURI(endpointUrl)
+	res := fasthttp.AcquireResponse()
+	if err := fasthttp.DoTimeout(req, res, opts.Timeout); err != nil {
 		return err
 	}
 
-	req.Header = _header
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+	fasthttp.ReleaseRequest(req)
+	fasthttp.ReleaseResponse(res)
 	return nil
 }
