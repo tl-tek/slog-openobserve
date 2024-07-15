@@ -5,11 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/samber/lo"
 	slogcommon "github.com/samber/slog-common"
 	"github.com/valyala/fasthttp"
 )
@@ -24,7 +24,8 @@ type Option struct {
 	Organization  string
 	Stream        string
 	CustomHeaders map[string]string
-	Timeout       time.Duration // default: 3s
+	Timeout       time.Duration // default: 10s
+	channel       chan map[string]any
 
 	// optional: customize webhook event builder
 	Converter Converter
@@ -44,7 +45,7 @@ func (o Option) NewOpenobserveHandler() slog.Handler {
 	}
 
 	if o.Timeout == 0 {
-		o.Timeout = 3 * time.Second
+		o.Timeout = 10 * time.Second
 	}
 
 	if o.Converter == nil {
@@ -58,6 +59,10 @@ func (o Option) NewOpenobserveHandler() slog.Handler {
 	if o.AttrFromContext == nil {
 		o.AttrFromContext = []func(ctx context.Context) []slog.Attr{}
 	}
+
+	sendCh := make(chan map[string]any, 100000)
+	o.channel = sendCh
+	go async(o) // sync logs to openobserve
 
 	return &OpenobserveHandler{
 		option: o,
@@ -81,14 +86,10 @@ func (h *OpenobserveHandler) Enabled(_ context.Context, level slog.Level) bool {
 func (h *OpenobserveHandler) Handle(ctx context.Context, record slog.Record) error {
 	fromContext := slogcommon.ContextExtractor(ctx, h.option.AttrFromContext)
 	payload := h.option.Converter(h.option.AddSource, h.option.ReplaceAttr, append(h.attrs, fromContext...), h.groups, &record)
-
-	go func() {
-		err := send(h.option, payload)
-		if err != nil {
-			log.Println("[ERROR] failed to send message to openobserve:", err)
-		}
-	}()
-
+	select {
+	case h.option.channel <- payload:
+	default:
+	}
 	return nil
 }
 
@@ -108,34 +109,45 @@ func (h *OpenobserveHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
-func send(opts Option, payload map[string]any) error {
-	req := fasthttp.AcquireRequest()
-	req.Header.SetContentType("application/json")
-	req.Header.SetUserAgent(name)
-	if opts.Username != "" && opts.Password != "" {
-		userPass := opts.Username + ":" + opts.Password
-		b64UserPass := base64.StdEncoding.EncodeToString([]byte(userPass))
-		req.Header.Set("Authorization", "Basic "+b64UserPass)
-	}
-	if len(opts.CustomHeaders) > 0 {
-		for k, v := range opts.CustomHeaders {
-			req.Header.Set(k, v)
+func async(opts Option) {
+	for {
+		// read 1k items
+		// wait up to 1 second
+		items, length, _, ok := lo.BufferWithTimeout(opts.channel, 1000, 1*time.Second)
+		if !ok {
+			break
 		}
-	}
-	bts, err := opts.Marshaler(payload)
-	if err != nil {
-		return err
-	}
-	req.SetBody(bts)
-	req.Header.SetMethod(http.MethodPost)
-	endpointUrl := fmt.Sprintf("%s/api/%s/%s/_multi", opts.Endpoint, opts.Organization, opts.Stream)
-	req.SetRequestURI(endpointUrl)
-	res := fasthttp.AcquireResponse()
-	if err := fasthttp.DoTimeout(req, res, opts.Timeout); err != nil {
-		return err
-	}
 
-	fasthttp.ReleaseRequest(req)
-	fasthttp.ReleaseResponse(res)
-	return nil
+		// empty logs
+		if length == 0 {
+			continue
+		}
+
+		// do batching stuff
+		req := fasthttp.AcquireRequest()
+		req.Header.SetContentType("application/json")
+		req.Header.SetUserAgent(name)
+		if opts.Username != "" && opts.Password != "" {
+			userPass := opts.Username + ":" + opts.Password
+			b64UserPass := base64.StdEncoding.EncodeToString([]byte(userPass))
+			req.Header.Set("Authorization", "Basic "+b64UserPass)
+		}
+		if len(opts.CustomHeaders) > 0 {
+			for k, v := range opts.CustomHeaders {
+				req.Header.Set(k, v)
+			}
+		}
+		bts, _ := opts.Marshaler(items)
+		req.SetBody(bts)
+		req.Header.SetMethod(http.MethodPost)
+		endpointUrl := fmt.Sprintf("%s/api/%s/%s/_json", opts.Endpoint, opts.Organization, opts.Stream)
+		req.SetRequestURI(endpointUrl)
+		res := fasthttp.AcquireResponse()
+		if err := fasthttp.DoTimeout(req, res, opts.Timeout); err != nil {
+			slog.Error("failed to send message to openobserve:", slog.Any("error", err))
+		}
+
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(res)
+	}
 }
