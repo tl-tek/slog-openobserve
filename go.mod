@@ -7,6 +7,7 @@ require (
 	github.com/samber/slog-common v0.18.1
 	github.com/valyala/fasthttp v1.59.0
 	go.uber.org/goleak v1.2.1
+	golang.org/x/time v0.10.0
 )
 
 require (
