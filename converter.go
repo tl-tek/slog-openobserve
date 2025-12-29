@@ -24,13 +24,12 @@ func DefaultConverter(addSource bool, replaceAttr func(groups []string, a slog.A
 	attrs = slogcommon.RemoveEmptyAttrs(attrs)
 
 	// handler formatter
-	log := map[string]any{
-		"@timestamp":     record.Time.UTC(),
-		"logger.name":    name,
-		"logger.version": version,
-		"level":          record.Level.String(),
-		"message":        record.Message,
-	}
+	log := mapPool.Get().(map[string]any)
+	log["@timestamp"] = record.Time.UTC()
+	log["logger.name"] = name
+	log["logger.version"] = version
+	log["level"] = record.Level.String()
+	log["message"] = record.Message
 
 	extra := slogcommon.AttrsToMap(attrs...)
 

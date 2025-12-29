@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +17,22 @@ import (
 	"github.com/valyala/fasthttp"
 	"golang.org/x/time/rate"
 )
+
+var mapPool = sync.Pool{
+	New: func() any {
+		return make(map[string]any, 16)
+	},
+}
+
+const (
+	shardCount     = 32
+	maxErrorKeyLen = 100
+)
+
+type shard struct {
+	mu       sync.RWMutex
+	limiters map[string]*rateLimiterEntry
+}
 
 type Option struct {
 	// log level (default: debug)
@@ -59,6 +77,10 @@ func (o Option) NewOpenobserveHandler() slog.Handler {
 		o.Level = slog.LevelDebug
 	}
 
+	if o.Endpoint != "" {
+		o.Endpoint = strings.TrimSuffix(o.Endpoint, "/")
+	}
+
 	if o.Timeout == 0 {
 		o.Timeout = 10 * time.Second
 	}
@@ -81,7 +103,7 @@ func (o Option) NewOpenobserveHandler() slog.Handler {
 
 	// Set defaults for rate limiting
 	if o.ErrorRateLimit == 0 {
-		o.ErrorRateLimit = rate.Every(1 * time.Second)
+		o.ErrorRateLimit = rate.Limit(10000)
 	}
 
 	if o.ErrorRateBurst <= 0 {
@@ -99,18 +121,30 @@ func (o Option) NewOpenobserveHandler() slog.Handler {
 	sendCh := make(chan map[string]any, 100000)
 	o.channel = sendCh
 
-	// Start multiple workers based on configuration
-	for i := 0; i < o.NumWorkers; i++ {
-		go worker(o, i)
+	h := &OpenobserveHandler{
+		option:      o,
+		attrs:       []slog.Attr{},
+		groups:      []string{},
+		cleanupDone: make(chan struct{}),
+		client: &fasthttp.Client{
+			Name:                      "slog-openobserve",
+			MaxConnsPerHost:           o.NumWorkers + 8,
+			MaxIdleConnDuration:       10 * time.Second,
+			ReadTimeout:               o.Timeout,
+			WriteTimeout:              o.Timeout,
+			MaxIdemponentCallAttempts: 1, // Fail fast, don't retry locally
+		},
 	}
 
-	h := &OpenobserveHandler{
-		option:       o,
-		attrs:        []slog.Attr{},
-		groups:       []string{},
-		rateLimiters: make(map[string]*rateLimiterEntry),
-		limiterMu:    &sync.RWMutex{},
-		cleanupDone:  make(chan struct{}),
+	// Start multiple workers based on configuration
+	for i := 0; i < o.NumWorkers; i++ {
+		go h.worker(i)
+	}
+
+	for i := 0; i < shardCount; i++ {
+		h.shards[i] = &shard{
+			limiters: make(map[string]*rateLimiterEntry),
+		}
 	}
 
 	// Start cleanup goroutine
@@ -122,12 +156,13 @@ func (o Option) NewOpenobserveHandler() slog.Handler {
 var _ slog.Handler = (*OpenobserveHandler)(nil)
 
 type OpenobserveHandler struct {
-	option       Option
-	attrs        []slog.Attr
-	groups       []string
-	rateLimiters map[string]*rateLimiterEntry
-	limiterMu    *sync.RWMutex
-	cleanupDone  chan struct{} // Signal channel for cleanup goroutine
+	option      Option
+	attrs       []slog.Attr
+	groups      []string
+	shards      [shardCount]*shard
+	cleanupDone chan struct{} // Signal channel for cleanup goroutine
+	stopOnce    sync.Once
+	client      *fasthttp.Client
 }
 
 // cleanupUnusedLimiters periodically removes unused rate limiters
@@ -139,16 +174,18 @@ func (h *OpenobserveHandler) cleanupUnusedLimiters() {
 		select {
 		case <-ticker.C:
 			now := time.Now()
-			h.limiterMu.Lock()
 
-			// Find limiters that haven't been used recently
-			for msg, entry := range h.rateLimiters {
-				if now.Sub(entry.lastUsed) > h.option.ErrorLimiterTTL {
-					delete(h.rateLimiters, msg)
+			for i := 0; i < shardCount; i++ {
+				s := h.shards[i]
+				s.mu.Lock()
+				// Find limiters that haven't been used recently
+				for msg, entry := range s.limiters {
+					if now.Sub(entry.lastUsed) > h.option.ErrorLimiterTTL {
+						delete(s.limiters, msg)
+					}
 				}
+				s.mu.Unlock()
 			}
-
-			h.limiterMu.Unlock()
 
 		case <-h.cleanupDone:
 			return
@@ -182,15 +219,27 @@ func (h *OpenobserveHandler) Handle(ctx context.Context, record slog.Record) err
 }
 
 // allowMessage checks if a message should be allowed based on rate limiting
+// allowMessage checks if a message should be allowed based on rate limiting
 func (h *OpenobserveHandler) allowMessage(msg string) bool {
-	h.limiterMu.RLock()
-	entry, exists := h.rateLimiters[msg]
-	h.limiterMu.RUnlock()
+	// Truncate message to avoid infinite key growth
+	if len(msg) > maxErrorKeyLen {
+		msg = msg[:maxErrorKeyLen]
+	}
+
+	// Calculate shard
+	hasher := fnv.New32a()
+	hasher.Write([]byte(msg))
+	shardIdx := hasher.Sum32() % uint32(shardCount)
+	s := h.shards[shardIdx]
+
+	s.mu.RLock()
+	entry, exists := s.limiters[msg]
+	s.mu.RUnlock()
 
 	if !exists {
-		h.limiterMu.Lock()
+		s.mu.Lock()
 		// Check again in case another goroutine created it while we were waiting for the lock
-		entry, exists = h.rateLimiters[msg]
+		entry, exists = s.limiters[msg]
 		if !exists {
 			// Create a new rate limiter for this error type
 			limiter := rate.NewLimiter(h.option.ErrorRateLimit, h.option.ErrorRateBurst)
@@ -198,17 +247,16 @@ func (h *OpenobserveHandler) allowMessage(msg string) bool {
 				limiter:  limiter,
 				lastUsed: time.Now(),
 			}
-			if h.rateLimiters == nil {
-				h.rateLimiters = make(map[string]*rateLimiterEntry)
-			}
-			h.rateLimiters[msg] = entry
+			s.limiters[msg] = entry
+		} else {
+			entry.lastUsed = time.Now()
 		}
-		h.limiterMu.Unlock()
+		s.mu.Unlock()
 	} else {
 		// Update last used time if the limiter already exists
-		h.limiterMu.Lock()
+		s.mu.Lock()
 		entry.lastUsed = time.Now()
-		h.limiterMu.Unlock()
+		s.mu.Unlock()
 	}
 
 	// Allow the message if the token bucket has tokens available
@@ -217,37 +265,38 @@ func (h *OpenobserveHandler) allowMessage(msg string) bool {
 
 func (h *OpenobserveHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &OpenobserveHandler{
-		option:       h.option,
-		attrs:        slogcommon.AppendAttrsToGroup(h.groups, h.attrs, attrs...),
-		groups:       h.groups,
-		rateLimiters: h.rateLimiters,
-		limiterMu:    h.limiterMu,
-		cleanupDone:  h.cleanupDone,
+		option:      h.option,
+		attrs:       slogcommon.AppendAttrsToGroup(h.groups, h.attrs, attrs...),
+		groups:      h.groups,
+		shards:      h.shards,
+		cleanupDone: h.cleanupDone,
 	}
 }
 
 func (h *OpenobserveHandler) WithGroup(name string) slog.Handler {
 	return &OpenobserveHandler{
-		option:       h.option,
-		attrs:        h.attrs,
-		groups:       append(h.groups, name),
-		rateLimiters: h.rateLimiters,
-		limiterMu:    h.limiterMu,
-		cleanupDone:  h.cleanupDone,
+		option:      h.option,
+		attrs:       h.attrs,
+		groups:      append(h.groups, name),
+		shards:      h.shards,
+		cleanupDone: h.cleanupDone,
 	}
 }
 
 // Shutdown ensures cleanup resources are properly released
 func (h *OpenobserveHandler) Shutdown() {
-	close(h.cleanupDone)
+	h.stopOnce.Do(func() {
+		close(h.cleanupDone)
+		close(h.option.channel)
+	})
 }
 
 // worker replaces the async function and processes logs in parallel
-func worker(opts Option, workerID int) {
+func (h *OpenobserveHandler) worker(workerID int) {
 	for {
 		// read 1k items
 		// wait up to 1 second
-		items, length, _, ok := lo.BufferWithTimeout(opts.channel, 1000, 1*time.Second)
+		items, length, _, ok := lo.BufferWithTimeout(h.option.channel, 1000, 1*time.Second)
 		if !ok {
 			break
 		}
@@ -261,23 +310,23 @@ func worker(opts Option, workerID int) {
 		req := fasthttp.AcquireRequest()
 		req.Header.SetContentType("application/json")
 		req.Header.SetUserAgent(name)
-		if opts.Username != "" && opts.Password != "" {
-			userPass := opts.Username + ":" + opts.Password
+		if h.option.Username != "" && h.option.Password != "" {
+			userPass := h.option.Username + ":" + h.option.Password
 			b64UserPass := base64.StdEncoding.EncodeToString([]byte(userPass))
 			req.Header.Set("Authorization", "Basic "+b64UserPass)
 		}
-		if len(opts.CustomHeaders) > 0 {
-			for k, v := range opts.CustomHeaders {
+		if len(h.option.CustomHeaders) > 0 {
+			for k, v := range h.option.CustomHeaders {
 				req.Header.Set(k, v)
 			}
 		}
-		bts, _ := opts.Marshaler(items)
+		bts, _ := h.option.Marshaler(items)
 		req.SetBody(bts)
 		req.Header.SetMethod(http.MethodPost)
-		endpointUrl := fmt.Sprintf("%s/api/%s/%s/_json", opts.Endpoint, opts.Organization, opts.Stream)
+		endpointUrl := fmt.Sprintf("%s/api/%s/%s/_json", h.option.Endpoint, h.option.Organization, h.option.Stream)
 		req.SetRequestURI(endpointUrl)
 		res := fasthttp.AcquireResponse()
-		if err := fasthttp.DoTimeout(req, res, opts.Timeout); err != nil {
+		if err := h.client.DoTimeout(req, res, h.option.Timeout); err != nil {
 			slog.Error("failed to send message to openobserve:",
 				slog.Any("error", err),
 				slog.Int("workerID", workerID))
@@ -285,5 +334,11 @@ func worker(opts Option, workerID int) {
 
 		fasthttp.ReleaseRequest(req)
 		fasthttp.ReleaseResponse(res)
+
+		// Release maps to pool
+		for _, item := range items {
+			clear(item)
+			mapPool.Put(item)
+		}
 	}
 }
